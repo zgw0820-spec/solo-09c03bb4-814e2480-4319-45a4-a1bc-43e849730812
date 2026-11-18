@@ -442,3 +442,259 @@ def test_repair_ignores_corrupt_source(app_env):
     status = client.get("/api/status").json()
     assert status["readable"] == 3
     assert client.get("/download").content == payload
+
+
+def _inode(storage: ObjectStorage, slot: int, version_id: str) -> tuple[int, int]:
+    row = storage.replica_rows(version_id)[slot]
+    stat = (storage.data_dir / row["relative_path"]).stat()
+    return stat.st_dev, stat.st_ino
+
+
+def test_repeated_upload_shares_physical_bytes_per_directory(app_env):
+    client, storage = app_env
+    payload = os.urandom(4096)
+
+    upload(client, payload, "same.bin")
+    first = storage.current_version()
+    upload(client, payload, "same-again.bin")
+    second = storage.current_version()
+    assert first.id != second.id
+    assert second.digest == first.digest
+
+    # 同槽位（同目录）共享 inode；不同槽位（三个独立目录）仍各自独立。
+    for slot in (1, 2, 3):
+        assert _inode(storage, slot, first.id) == _inode(storage, slot, second.id)
+    assert _inode(storage, 1, first.id) != _inode(storage, 2, first.id)
+
+    # 两个版本都可独立下载，字节完全一致。
+    assert client.get(f"/download?version_id={first.id}").content == payload
+    assert client.get(f"/download?version_id={second.id}").content == payload
+    assert client.get("/download").content == payload
+
+    usage = storage.replica_usage()
+    size = len(payload)
+    for slot in (1, 2, 3):
+        item = usage["slots"][slot]
+        assert item["file_count"] == 2
+        assert item["logical_bytes"] == 2 * size
+        assert item["physical_bytes"] == size
+        assert item["saved_bytes"] == size
+        assert item["shared_inodes"] == 1
+    assert usage["total"]["saved_bytes"] == 3 * size
+    assert usage["total"]["physical_bytes"] == 3 * size
+
+    # 再上传不同内容：无同摘要候选，必须独立写入，不与旧版本共享。
+    other = b"totally-different-content" * 64
+    upload(client, other)
+    third = storage.current_version()
+    for slot in (1, 2, 3):
+        assert _inode(storage, slot, third.id) != _inode(storage, slot, first.id)
+    usage = storage.replica_usage()
+    for slot in (1, 2, 3):
+        item = usage["slots"][slot]
+        assert item["file_count"] == 3
+        assert item["physical_bytes"] == size + len(other)
+        assert item["saved_bytes"] == size
+
+    status = client.get("/api/status").json()
+    assert status["usage"]["total"]["saved_bytes"] == 3 * size
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "副本目录占用" in page.text and "节省量" in page.text
+
+
+def test_new_upload_always_independent_from_other_slots(app_env):
+    client, storage = app_env
+    payload = b"cross-slot-must-not-share" * 100
+    upload(client, payload)
+    first = storage.current_version()
+    upload(client, payload)
+    second = storage.current_version()
+
+    inodes = {slot: _inode(storage, slot, first.id) for slot in (1, 2, 3)}
+    assert len(set(inodes.values())) == 3
+    for slot in (1, 2, 3):
+        assert _inode(storage, slot, second.id) == inodes[slot]
+
+
+def test_reuse_requires_verified_registered_replica(app_env):
+    client, storage = app_env
+    payload = os.urandom(1500)
+    upload(client, payload)
+    first = storage.current_version()
+
+    # 把槽位 1 已登记副本改成坏字节：它不能作为复用源。
+    bad_path = replica_path(storage, 1, first.id)
+    bad_path.write_bytes(b"corrupt-bytes-on-disk")
+
+    # 再次上传相同内容：槽位 1 找不到已验真候选，必须独立写入；
+    # 槽位 2/3 的候选磁盘验真通过，照常硬链接复用。
+    upload(client, payload)
+    second = storage.current_version()
+    assert _inode(storage, 1, first.id) != _inode(storage, 1, second.id)
+    assert _inode(storage, 2, first.id) == _inode(storage, 2, second.id)
+    assert _inode(storage, 3, first.id) == _inode(storage, 3, second.id)
+
+    # 新副本自身全部通过摘要验真，下载不受坏候选影响。
+    checks = {c.slot: c for c in storage.check_replicas(second)}
+    assert all(checks[s].state == "verified" for s in (1, 2, 3))
+    assert client.get("/download").content == payload
+
+
+def test_corrupting_one_version_keeps_other_versions_downloadable(app_env):
+    client, storage = app_env
+    payload = os.urandom(2048)
+    upload(client, payload)
+    first = storage.current_version()
+    upload(client, payload)
+    second = storage.current_version()
+
+    # 走系统的“模拟损坏”：原子替换为新 inode，只断开当前版本该槽位的目录项，
+    # 旧版本的目录项仍指向原 inode，下载结果不变。
+    response = client.post(
+        "/replicas/2/corrupt",
+        data={"version_id": second.id},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    assert _inode(storage, 2, first.id) != _inode(storage, 2, second.id)
+    checks_first = {c.slot: c for c in storage.check_replicas(first)}
+    checks_second = {c.slot: c for c in storage.check_replicas(second)}
+    assert checks_first[2].state == "verified"
+    assert checks_second[2].state == "corrupt"
+
+    # 旧版本三副本仍全部健康，可原样下载；当前版本降级为 2/3 仍可下载。
+    assert all(c.state == "verified" for c in checks_first.values())
+    assert client.get(f"/download?version_id={first.id}").content == payload
+    assert client.get("/download").content == payload
+    assert client.get("/api/status").json()["readable"] == 2
+
+    # 巡检修复当前版本：从当前版本自己的已验真副本复制（独立新 inode），
+    # 修复后不影响旧版本。
+    inspect(client)
+    assert client.get("/api/status").json()["readable"] == 3
+    assert client.get(f"/download?version_id={first.id}").content == payload
+    assert client.get("/download").content == payload
+    # 修复写的是独立字节，两个版本该槽位不再共享 inode。
+    assert _inode(storage, 2, first.id) != _inode(storage, 2, second.id)
+
+
+def test_prune_does_not_release_bytes_still_used_by_retained_versions(app_env):
+    client, storage = app_env
+    from app.storage import RETAINED_VERSION_REPLICAS
+
+    shared_payload = os.urandom(3000)
+    upload(client, shared_payload)
+    oldest = storage.current_version()
+    old_inode = _inode(storage, 1, oldest.id)
+
+    # 后续上传交替使用相同/不同内容，凑满保留窗口并把最老版本挤出窗口。
+    for i in range(RETAINED_VERSION_REPLICAS):
+        if i % 2 == 0:
+            upload(client, shared_payload)
+        else:
+            upload(client, f"distinct-{i}".encode() * 10)
+    assert storage.get_version(oldest.id) is not None  # 登记仍在
+    assert not replica_path(storage, 1, oldest.id).exists()  # 副本已清退
+
+    # 仍在保留窗口内、同摘要的版本继续使用同一物理字节，没有被误释放。
+    survivors = [
+        v for v in storage.list_versions(20)
+        if v.digest == oldest.digest and v.id != oldest.id
+    ]
+    assert survivors, "应当还有同摘要的保留版本"
+    for version in survivors:
+        for slot in (1, 2, 3):
+            path = replica_path(storage, slot, version.id)
+            assert path.exists() and path.read_bytes() == shared_payload
+    assert _inode(storage, 1, survivors[0].id) == old_inode
+    assert client.get(f"/download?version_id={survivors[0].id}").content == shared_payload
+
+    # 被清退版本下载被拒绝，而不是交付其它版本的字节。
+    assert client.get(f"/download?version_id={oldest.id}").status_code == 409
+
+    # 占用统计只数仍在磁盘上的登记副本，清退项不计入。
+    usage = storage.replica_usage()
+    assert all(
+        usage["slots"][slot]["file_count"] == RETAINED_VERSION_REPLICAS
+        for slot in (1, 2, 3)
+    )
+    assert usage["total"]["physical_bytes"] > 0
+
+
+def test_restart_cleanup_keeps_shared_registered_bytes(app_env):
+    client, storage = app_env
+    payload = os.urandom(1200)
+    upload(client, payload)
+    first = storage.current_version()
+    upload(client, payload)
+    second = storage.current_version()
+
+    # 残留的中断上传临时文件（即便意外硬链接到已登记 inode）。
+    leftover = storage.replica_dirs[1] / ".tmp-upload-leftover"
+    os.link(replica_path(storage, 1, first.id), leftover)
+    leftover_tmp = storage.replica_dirs[2] / ".tmp-repair-leftover"
+    leftover_tmp.write_bytes(b"partial")
+
+    restarted = ObjectStorage(storage.data_dir)
+    restarted.init()
+    assert not leftover.exists() and not leftover_tmp.exists()
+
+    # 临时目录项被摘除，但登记副本的物理字节仍在，两个版本下载都不变。
+    for version in (first, second):
+        for slot in (1, 2, 3):
+            assert replica_path(restarted, slot, version.id).read_bytes() == payload
+    app = create_app(storage.data_dir, start_background=False)
+    restarted_client = TestClient(app)
+    with restarted_client:
+        assert restarted_client.get(f"/download?version_id={first.id}").content == payload
+        assert restarted_client.get("/download").content == payload
+
+
+def test_failed_upload_never_switches_version_and_retry_reuses(app_env):
+    client, storage = app_env
+    upload(client, b"established-content")
+    current = storage.current_version()
+
+    # 超限上传在写盘前即被拒绝，当前版本指针不变。
+    response = upload(client, b"z" * (1024 * 1024 + 1))
+    assert response.status_code == 303
+    assert storage.current_version().id == current.id
+
+    # 磁盘上没有任何未登记残留目录项。
+    for directory in storage.replica_dirs.values():
+        assert list(directory.glob(".tmp-*")) == []
+
+    # 重试上传与既有版本同摘要的内容：直接从已验真版本硬链接复用。
+    retry_payload = b"established-content"
+    upload(client, retry_payload)
+    retried = storage.current_version()
+    assert retried.id != current.id
+    for slot in (1, 2, 3):
+        assert _inode(storage, slot, current.id) == _inode(storage, slot, retried.id)
+    assert client.get("/download").content == retry_payload
+    assert client.get(f"/download?version_id={current.id}").content == retry_payload
+
+
+def test_repeated_distinct_uploads_accounting_matches_disk(app_env):
+    client, storage = app_env
+    payloads = [os.urandom(500 + i * 37) for i in range(4)]
+    for payload in payloads:
+        upload(client, payload)
+        upload(client, payload)  # 立即重复上传，全部走硬链接复用
+
+    usage = storage.replica_usage()
+    for slot in (1, 2, 3):
+        item = usage["slots"][slot]
+        assert item["file_count"] == 8
+        assert item["physical_bytes"] == sum(len(p) for p in payloads)
+        assert item["logical_bytes"] == 2 * item["physical_bytes"]
+        assert item["saved_bytes"] == item["physical_bytes"]
+
+    # 用磁盘 du 口径交叉核对：目录实际块占用不超过物理字节量级（共享生效）。
+    for slot in (1, 2, 3):
+        entries = list(storage.replica_dirs[slot].glob("v-*.bin"))
+        assert len(entries) == 8
+        inodes = {p.stat().st_ino for p in entries}
+        assert len(inodes) == 4

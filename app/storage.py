@@ -86,6 +86,7 @@ class ReplicaCheck:
     observed_size: int | None
     observed_digest: str | None
     note: str | None = None
+    link_count: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -327,6 +328,62 @@ class ObjectStorage:
         finally:
             temp.unlink(missing_ok=True)
 
+    def _atomic_link(self, source: Path, destination: Path) -> None:
+        """在同一副本目录内建立硬链接，使两份登记副本共享同一份物理字节。
+
+        先链接到同目录临时名再 os.replace，目标路径始终原子可见；跨设备或
+        文件系统不支持硬链接时回退为普通原子写，由调用方自行校验。
+        """
+        if source.parent != destination.parent:
+            raise StorageError("只允许在同一副本目录内复用物理字节。")
+        temp = destination.parent / f".tmp-link-{uuid.uuid4().hex}"
+        try:
+            os.link(source, temp)
+            os.replace(temp, destination)
+            try:
+                dir_fd = os.open(destination.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        except OSError:
+            temp.unlink(missing_ok=True)
+            raise
+        finally:
+            temp.unlink(missing_ok=True)
+
+    def _find_reuse_source(
+        self, conn: sqlite3.Connection, slot: int, digest: str, size: int
+    ) -> tuple[Path, int] | None:
+        """只从同槽位、且已通过登记摘要验真的版本寻找可复用字节。
+
+        候选必须同时满足：
+        1. 与待写入版本在同一副本槽位（三个目录各自独立，绝不跨目录共享）；
+        2. 该版本登记的 SHA-256 与本次内容一致；
+        3. 磁盘上的实际文件存在、长度一致且重新计算摘要仍与登记值相符——
+           不信任数据库里的巡检缓存状态，损坏或缺失的候选直接跳过。
+        """
+        rows = conn.execute(
+            """
+            SELECT r.relative_path AS rel, v.seq AS seq
+              FROM replicas r JOIN versions v ON v.id = r.version_id
+             WHERE r.slot = ? AND v.digest = ? AND v.size = ?
+             ORDER BY v.seq DESC
+            """,
+            (slot, digest, size),
+        ).fetchall()
+        for row in rows:
+            try:
+                path = self._abs_path(row["rel"])
+                observed_digest, observed_size = _hash_file(path)
+            except (OSError, StorageError):
+                continue
+            if observed_size == size and observed_digest == digest:
+                return path, int(row["seq"])
+        return None
+
     # ------------------------------------------------------------- read helpers
     def current_version(self) -> Version | None:
         with self._db() as conn:
@@ -385,6 +442,7 @@ class ObjectStorage:
                     ReplicaCheck(slot, rel, "unreadable", False, None, None, str(exc))
                 )
                 continue
+            link_count = int(stat.st_nlink)
             try:
                 if stat.st_size > MAX_OBJECT_BYTES:
                     checks.append(
@@ -396,6 +454,7 @@ class ObjectStorage:
                             stat.st_size,
                             None,
                             "副本超过 1 MiB 上限，无法作为有效对象读取",
+                            link_count=link_count,
                         )
                     )
                     continue
@@ -409,13 +468,17 @@ class ObjectStorage:
                             stat.st_size,
                             None,
                             f"长度不符（应为 {version.size} 字节）",
+                            link_count=link_count,
                         )
                     )
                     continue
                 observed_digest, observed_size = _hash_file(path)
             except OSError as exc:
                 checks.append(
-                    ReplicaCheck(slot, rel, "unreadable", True, None, None, str(exc))
+                    ReplicaCheck(
+                        slot, rel, "unreadable", True, None, None, str(exc),
+                        link_count=link_count,
+                    )
                 )
                 continue
             if observed_size != version.size:
@@ -428,6 +491,7 @@ class ObjectStorage:
                         observed_size,
                         observed_digest,
                         "读取过程中长度发生变化",
+                        link_count=link_count,
                     )
                 )
             elif observed_digest != version.digest:
@@ -440,6 +504,7 @@ class ObjectStorage:
                         observed_size,
                         observed_digest,
                         "SHA-256 摘要与当前版本登记值不符",
+                        link_count=link_count,
                     )
                 )
             else:
@@ -452,6 +517,7 @@ class ObjectStorage:
                         observed_size,
                         observed_digest,
                         None,
+                        link_count=link_count,
                     )
                 )
         return checks
@@ -524,12 +590,33 @@ class ObjectStorage:
                 created_at=created_at,
                 status="current",
             )
+            # 仅记录本版本新建的目录项（含硬链接项）；失败回滚只摘除这些项，
+            # 硬链接的来源版本仍保留自己的目录项，物理字节不会被释放。
             written: list[Path] = []
+            reused: dict[int, int] = {}
             try:
                 for slot in REPLICA_SLOTS:
                     rel = self._relative_replica_path(version_id, slot)
                     path = self._abs_path(rel)
-                    self._atomic_write(path, data)
+                    with self._db() as conn:
+                        source = self._find_reuse_source(conn, slot, digest, len(data))
+                    if source is not None:
+                        source_path, source_seq = source
+                        try:
+                            self._atomic_link(source_path, path)
+                        except OSError as exc:
+                            # 硬链接不可用（跨设备/文件系统不支持）时回退独立写入。
+                            self._log_standalone(
+                                "warning",
+                                "dedup_fallback",
+                                f"副本 {slot} 硬链接复用失败，改为独立写入：{exc}",
+                                version_id=version_id,
+                            )
+                            self._atomic_write(path, data)
+                        else:
+                            reused[slot] = source_seq
+                    else:
+                        self._atomic_write(path, data)
                     written.append(path)
                     observed, observed_size = _hash_file(path)
                     if observed != digest or observed_size != len(data):
@@ -552,14 +639,19 @@ class ObjectStorage:
                     )
                     for slot in REPLICA_SLOTS:
                         rel = self._relative_replica_path(version_id, slot)
+                        note = (
+                            f"与同目录版本 #{reused[slot]} 共享物理字节（硬链接）"
+                            if slot in reused
+                            else None
+                        )
                         conn.execute(
                             """
                             INSERT INTO replicas(
                                 version_id, slot, relative_path, last_checked_at,
                                 last_check_state, observed_digest, observed_size, note
-                            ) VALUES (?, ?, ?, ?, 'verified', ?, ?, NULL)
+                            ) VALUES (?, ?, ?, ?, 'verified', ?, ?, ?)
                             """,
-                            (version.id, slot, rel, created_at, digest, len(data)),
+                            (version.id, slot, rel, created_at, digest, len(data), note),
                         )
                     conn.execute(
                         "UPDATE versions SET status = 'superseded' WHERE status = 'current'"
@@ -571,12 +663,26 @@ class ObjectStorage:
                         "UPDATE objects SET current_version_id = ? WHERE id = 1",
                         (version.id,),
                     )
+                    if reused:
+                        shared = "、".join(
+                            f"副本 {slot} 复用版本 #{source_seq}"
+                            for slot, source_seq in sorted(reused.items())
+                        )
+                        upload_message = (
+                            f"登记版本 #{version.seq}（{len(data)} 字节，"
+                            f"SHA-256 {digest}），三个副本均通过摘要校验；{shared}，"
+                            "复用字节与新登记版本共享同一物理文件。"
+                        )
+                    else:
+                        upload_message = (
+                            f"登记版本 #{version.seq}（{len(data)} 字节，SHA-256 {digest}），"
+                            "三个副本均独立写入并通过摘要校验。"
+                        )
                     self._log(
                         conn,
                         "info",
                         "upload",
-                        f"登记版本 #{version.seq}（{len(data)} 字节，SHA-256 {digest}），"
-                        "三个副本均已写入并通过摘要校验。",
+                        upload_message,
                         version_id=version.id,
                     )
             except BaseException:
@@ -593,6 +699,19 @@ class ObjectStorage:
             )
             self._prune_old_versions()
             return version
+
+    def version_shared_slots(self, version_id: str) -> dict[int, int]:
+        """返回该版本各副本与其它登记版本共享物理字节（硬链接数 > 1）的槽位。"""
+        rows = self.replica_rows(version_id)
+        shared: dict[int, int] = {}
+        for slot, row in rows.items():
+            try:
+                link_count = self._abs_path(row["relative_path"]).stat().st_nlink
+            except OSError:
+                continue
+            if link_count > 1:
+                shared[slot] = int(link_count)
+        return shared
 
     def _prune_old_versions(self) -> None:
         """只保留最近若干版本的副本文件，避免磁盘无限增长。
@@ -1023,6 +1142,60 @@ class ObjectStorage:
             return checks
 
     # --------------------------------------------------------------- reporting
+    def replica_usage(self) -> dict[str, Any]:
+        """按副本目录统计实际磁盘占用与硬链接节省量。
+
+        - logical_bytes：登记副本若各自独立存放应占的字节总和；
+        - physical_bytes：按 (st_dev, st_ino) 去重后的真实物理字节；
+        - saved_bytes：同目录内内容一致的保留版共享物理字节所节省的空间；
+        - file_count / shared_inodes：目录项数量与被多个登记副本共享的 inode 数。
+        三个目录各自独立统计，绝不跨目录共享。
+        """
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT slot, relative_path FROM replicas ORDER BY slot"
+            ).fetchall()
+        per_slot: dict[int, dict[str, Any]] = {
+            slot: {
+                "slot": slot,
+                "logical_bytes": 0,
+                "physical_bytes": 0,
+                "saved_bytes": 0,
+                "file_count": 0,
+                "shared_inodes": 0,
+            }
+            for slot in REPLICA_SLOTS
+        }
+        totals = {
+            "logical_bytes": 0,
+            "physical_bytes": 0,
+            "saved_bytes": 0,
+            "file_count": 0,
+            "shared_inodes": 0,
+        }
+        seen: dict[int, set[tuple[int, int]]] = {slot: set() for slot in REPLICA_SLOTS}
+        for row in rows:
+            slot = row["slot"]
+            entry = per_slot[slot]
+            try:
+                stat = self._abs_path(row["relative_path"]).stat()
+            except OSError:
+                # 已按保留策略清理或实际缺失的登记副本不占磁盘空间。
+                continue
+            entry["file_count"] += 1
+            entry["logical_bytes"] += stat.st_size
+            identity = (stat.st_dev, stat.st_ino)
+            if identity not in seen[slot]:
+                seen[slot].add(identity)
+                entry["physical_bytes"] += stat.st_size
+                if stat.st_nlink > 1:
+                    entry["shared_inodes"] += 1
+        for entry in per_slot.values():
+            entry["saved_bytes"] = entry["logical_bytes"] - entry["physical_bytes"]
+            for key in totals:
+                totals[key] += entry[key]
+        return {"slots": per_slot, "total": totals}
+
     def recent_inspections(self, limit: int = 10) -> list[Inspection]:
         with self._db() as conn:
             rows = conn.execute(

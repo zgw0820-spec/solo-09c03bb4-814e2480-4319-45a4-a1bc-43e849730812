@@ -75,7 +75,7 @@
 
       <table class="replicas">
         <thead>
-          <tr><th>副本</th><th>目录/路径</th><th>状态</th><th>实测大小</th><th>实测 SHA-256</th><th>说明</th><th>操作</th></tr>
+          <tr><th>副本</th><th>目录/路径</th><th>状态</th><th>实测大小</th><th>实测 SHA-256</th><th>物理引用</th><th>说明</th><th>操作</th></tr>
         </thead>
         <tbody>
         {% for check in checks %}
@@ -85,6 +85,12 @@
             <td><span class="state-pill state-{{ check.state }}">{{ state_labels.get(check.state, check.state) }}</span></td>
             <td>{{ check.observed_size if check.observed_size is not none else "—" }}</td>
             <td class="mono small">{{ check.observed_digest or "—" }}</td>
+            <td>
+              {% if check.link_count is not none %}
+                {{ check.link_count }} 个目录项
+                {% if check.link_count > 1 %}<span class="badge badge-good">共享</span>{% endif %}
+              {% else %}—{% endif %}
+            </td>
             <td class="small">{{ check.note or "" }}</td>
             <td>
               <form method="post" action="/replicas/{{ check.slot }}/corrupt" class="inline"
@@ -103,8 +109,44 @@
   </section>
 
   <section class="card">
+    <h2>副本目录占用</h2>
+    <p class="muted">
+      同一副本目录内内容一致的保留版本通过硬链接共享同一份物理字节；三个目录各自独立、互不共享。
+      「逻辑占用」为各登记副本大小之和，「物理占用」按实际 inode 去重统计，差额即节省量。
+    </p>
+    <table>
+      <thead>
+        <tr><th>副本目录</th><th>登记副本数</th><th>逻辑占用（字节）</th><th>实际物理占用（字节）</th><th>节省量（字节）</th><th>共享物理文件数</th></tr>
+      </thead>
+      <tbody>
+      {% for slot in (1, 2, 3) %}
+        {% set item = usage.slots[slot] %}
+        <tr>
+          <td><code>replica-{{ slot }}</code></td>
+          <td>{{ item.file_count }}</td>
+          <td>{{ item.logical_bytes }}</td>
+          <td>{{ item.physical_bytes }}</td>
+          <td><strong>{{ item.saved_bytes }}</strong></td>
+          <td>{{ item.shared_inodes }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr>
+          <td><strong>三个目录合计</strong></td>
+          <td>{{ usage.total.file_count }}</td>
+          <td>{{ usage.total.logical_bytes }}</td>
+          <td>{{ usage.total.physical_bytes }}</td>
+          <td><strong>{{ usage.total.saved_bytes }}</strong></td>
+          <td>{{ usage.total.shared_inodes }}</td>
+        </tr>
+      </tfoot>
+    </table>
+  </section>
+
+  <section class="card">
     <h2>上传 / 替换</h2>
-    <p class="muted">上限 1 MiB（{{ max_bytes }} 字节）。替换会生成新版本；旧巡检结果不会覆盖新版本。</p>
+    <p class="muted">上限 1 MiB（{{ max_bytes }} 字节）。替换会生成新版本；若同目录已有同摘要且已验真的保留版本，新副本以硬链接复用其物理字节，否则独立写入。旧巡检结果不会覆盖新版本。</p>
     <form method="post" action="/upload" enctype="multipart/form-data" class="upload">
       <input type="file" name="file" required>
       <button type="submit">上传并登记新版本</button>

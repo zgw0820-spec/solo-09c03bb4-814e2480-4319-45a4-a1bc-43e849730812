@@ -172,6 +172,7 @@ def create_app(
             "notice_level": level,
             "max_bytes": MAX_OBJECT_BYTES,
             "now": utc_now(),
+            "usage": storage.replica_usage(),
         }
         return templates.TemplateResponse(request, "index.html", ctx)
 
@@ -210,10 +211,19 @@ def create_app(
         finally:
             if form is not None:
                 await form.close()
-        message = (
-            f"已登记版本 #{version.seq}，SHA-256 {version.digest}，"
-            "三个副本均写入并验真。"
-        )
+        shared = await run_in_threadpool(storage.version_shared_slots, version.id)
+        if shared:
+            slots = "、".join(f"副本 {slot}（共享 {links} 个目录项）"
+                             for slot, links in sorted(shared.items()))
+            message = (
+                f"已登记版本 #{version.seq}，SHA-256 {version.digest}，三个副本均验真；"
+                f"{slots} 与同目录已验真版本共享物理字节，未重复占盘。"
+            )
+        else:
+            message = (
+                f"已登记版本 #{version.seq}，SHA-256 {version.digest}，"
+                "三个副本均独立写入并验真。"
+            )
         return _redirect_notice(message, "success")
 
     @app.post("/replicas/{slot}/corrupt")
@@ -301,6 +311,7 @@ def create_app(
                 "readable": verified,
                 "unrecoverable": bool(version and verified == 0),
                 "replicas": [check.as_dict() for check in checks],
+                "usage": storage.replica_usage(),
                 "running": (
                     {"id": running.id, "progress": running.progress}
                     if running
